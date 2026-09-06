@@ -1,0 +1,104 @@
+name: Frozen npm 2026.9.1 first-hop proof
+
+on:
+  push:
+    branches:
+      - proof/npm-2026-9-1-first-hop-20260906
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: proof-npm-2026-9-1-first-hop
+  cancel-in-progress: false
+
+jobs:
+  first-hop:
+    if: github.repository == 'TheCrazyLex/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout proof instrumentation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preserve proof instrumentation separately from product source
+        run: |
+          mkdir -p "$RUNNER_TEMP/first-hop-evidence"
+          cp scripts/e2e/proof-npm-2026-9-1-first-hop.mjs "$RUNNER_TEMP/"
+          git rev-parse HEAD > "$RUNNER_TEMP/first-hop-evidence/proof-sha.txt"
+
+      - name: Checkout exact PR candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 6b4ab193ef2386294f8c856b0f50997f7a9cd79a
+          persist-credentials: false
+
+      - name: Setup pinned package toolchain
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          install-deps: "true"
+          frozen-lockfile: "true"
+          cache-mode: "off"
+          dependency-cache: "false"
+
+      - name: Build canonical installable candidate
+        run: |
+          test "$(git rev-parse HEAD)" = 6b4ab193ef2386294f8c856b0f50997f7a9cd79a
+          git diff --exit-code
+          git rev-parse HEAD > "$RUNNER_TEMP/first-hop-evidence/candidate-sha.txt"
+          node scripts/package-openclaw-for-docker.mjs \
+            --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/first-hop-candidate" \
+            --output-name openclaw-current.tgz \
+            2>&1 | tee "$RUNNER_TEMP/first-hop-evidence/package-build.log"
+          sha256sum "$RUNNER_TEMP/first-hop-candidate/openclaw-current.tgz" \
+            > "$RUNNER_TEMP/first-hop-evidence/candidate-sha256.txt"
+
+      - name: Download and verify frozen npm 2026.9.1
+        run: |
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' \
+            https://registry.npmjs.org/openclaw/-/openclaw-2026.9.1.tgz \
+            --output "$RUNNER_TEMP/openclaw-2026.9.1.tgz"
+          printf '%s  %s\n' \
+            1bfcac877d53f1e41b69d15c24e081895b2f07d6ff2ffdfe0bf8a7336ab00e59 \
+            "$RUNNER_TEMP/openclaw-2026.9.1.tgz" \
+            | tee "$RUNNER_TEMP/first-hop-evidence/source-sha256.txt" \
+            | sha256sum --check
+
+      - name: Capture live first-hop evidence in the existing Docker harness
+        run: |
+          # Apply only after packing: the product tarball remains the exact PR candidate.
+          node "$RUNNER_TEMP/proof-npm-2026-9-1-first-hop.mjs"
+          git diff -- scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh \
+            > "$RUNNER_TEMP/first-hop-evidence/proof-harness.patch"
+          bash -n scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh
+
+      - name: Run frozen negative, repaired first hop, and future hop in Docker
+        env:
+          OPENCLAW_QA_ALLOW_UPDATE_FIRST_HOP: "1"
+          OPENCLAW_UPDATE_FIRST_HOP_EXPECTED_MISSING_CHUNK: shared-DFJEouXv.js
+          OPENCLAW_UPDATE_FIRST_HOP_DOCKER_RUN_TIMEOUT: 1200s
+        run: |
+          export OPENCLAW_UPDATE_FIRST_HOP_SOURCE_PACKAGE_TGZ="$RUNNER_TEMP/openclaw-2026.9.1.tgz"
+          export OPENCLAW_UPDATE_FIRST_HOP_CANDIDATE_PACKAGE_TGZ="$RUNNER_TEMP/first-hop-candidate/openclaw-current.tgz"
+          export OPENCLAW_UPDATE_FIRST_HOP_ARTIFACT_DIR="$RUNNER_TEMP/first-hop-evidence/runtime"
+          bash scripts/e2e/update-first-hop-compat-docker.sh \
+            2>&1 | tee "$RUNNER_TEMP/first-hop-evidence/docker.log"
+
+      - name: Upload proof and failure evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: frozen-npm-2026-9-1-first-hop-proof
+          path: ${{ runner.temp }}/first-hop-evidence
+          if-no-files-found: error
+          retention-days: 30
