@@ -1,0 +1,106 @@
+name: Legacy and modern packaged update history proof
+
+on:
+  push:
+    branches:
+      - proof/legacy-update-ledger-20260906
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: proof-legacy-update-ledger
+  cancel-in-progress: false
+
+jobs:
+  update-history:
+    if: github.repository == 'TheCrazyLex/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout proof instrumentation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preserve observation code separately from product source
+        run: |
+          mkdir -p "$RUNNER_TEMP/update-history-evidence"
+          cp scripts/e2e/proof-update-run-history.mjs "$RUNNER_TEMP/"
+          git rev-parse HEAD > "$RUNNER_TEMP/update-history-evidence/proof-sha.txt"
+
+      - name: Checkout exact PR candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 825ffb9a8f21a33a1dda292d28a4d40fbbdda794
+          persist-credentials: false
+
+      - name: Setup pinned package toolchain
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          install-deps: "true"
+          frozen-lockfile: "true"
+          cache-mode: "off"
+          dependency-cache: "false"
+
+      - name: Build canonical installable candidate
+        run: |
+          test "$(git rev-parse HEAD)" = 825ffb9a8f21a33a1dda292d28a4d40fbbdda794
+          git diff --exit-code
+          git rev-parse HEAD > "$RUNNER_TEMP/update-history-evidence/candidate-sha.txt"
+          node scripts/package-openclaw-for-docker.mjs \
+            --allow-unreleased-changelog \
+            --output-dir "$RUNNER_TEMP/update-history-candidate" \
+            --output-name openclaw-current.tgz \
+            2>&1 | tee "$RUNNER_TEMP/update-history-evidence/package-build.log"
+          sha256sum "$RUNNER_TEMP/update-history-candidate/openclaw-current.tgz" \
+            > "$RUNNER_TEMP/update-history-evidence/candidate-sha256.txt"
+
+      - name: Download and verify published legacy updater
+        run: |
+          curl --fail --show-error --silent --location \
+            --proto '=https' --proto-redir '=https' \
+            https://registry.npmjs.org/openclaw/-/openclaw-2026.8.2.tgz \
+            --output "$RUNNER_TEMP/openclaw-2026.8.2.tgz"
+          printf '%s  %s\n' \
+            20e9c2f16742dfcebfb21504e51067d31e000a19577126ff4fab117e5e87dbe2 \
+            "$RUNNER_TEMP/openclaw-2026.8.2.tgz" \
+            | tee "$RUNNER_TEMP/update-history-evidence/source-sha256.txt" \
+            | sha256sum --check
+
+      - name: Add read-only history and live Gateway observations
+        run: |
+          # The tarball above retains exact PR bytes; only the Docker harness is instrumented.
+          cp "$RUNNER_TEMP/proof-update-run-history.mjs" scripts/e2e/
+          node scripts/e2e/proof-update-run-history.mjs instrument
+          git diff -- scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh \
+            > "$RUNNER_TEMP/update-history-evidence/proof-harness.patch"
+          cp scripts/e2e/proof-update-run-history.mjs "$RUNNER_TEMP/update-history-evidence/"
+          bash -n scripts/e2e/lib/upgrade-survivor/update-first-hop-compat.sh
+
+      - name: Exercise frozen legacy upgrade and modern future hop in Docker
+        env:
+          OPENCLAW_QA_ALLOW_UPDATE_FIRST_HOP: "1"
+          OPENCLAW_UPDATE_FIRST_HOP_EXPECTED_MISSING_CHUNK: shared-Y6bNiw2w.js
+          OPENCLAW_UPDATE_FIRST_HOP_DOCKER_RUN_TIMEOUT: 1200s
+        run: |
+          export OPENCLAW_UPDATE_FIRST_HOP_SOURCE_PACKAGE_TGZ="$RUNNER_TEMP/openclaw-2026.8.2.tgz"
+          export OPENCLAW_UPDATE_FIRST_HOP_CANDIDATE_PACKAGE_TGZ="$RUNNER_TEMP/update-history-candidate/openclaw-current.tgz"
+          export OPENCLAW_UPDATE_FIRST_HOP_ARTIFACT_DIR="$RUNNER_TEMP/update-history-evidence/runtime"
+          bash scripts/e2e/update-first-hop-compat-docker.sh \
+            2>&1 | tee "$RUNNER_TEMP/update-history-evidence/docker.log"
+
+      - name: Upload proof and failure evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: legacy-and-modern-update-history-proof
+          path: ${{ runner.temp }}/update-history-evidence
+          if-no-files-found: error
+          retention-days: 30
